@@ -582,14 +582,22 @@ def get_latest_data_per_instrument(data_rows: List[Dict[str, Any]]) -> Dict[str,
     return latest_data
 
 def extract_event_names_from_dsl(dsl_code: str) -> List[str]:
-    """Extract all event names referenced in DSL code (EVENT_NAME.field pattern)"""
+    """Extract all event names referenced in DSL code (EVENT_NAME.field pattern).
+
+    Event names may be ANY identifier casing — including lowercase / snake_case
+    like `line_items`. In the DSL a dot only ever means an event-field access
+    (`EVENT.field`), so we match any `identifier.field`. (A previous version
+    required an UPPERCASE first letter, which silently dropped lowercase event
+    names → the whole run fell into standalone mode and failed with
+    `name '<event>' is not defined`.) A matched name that isn't a real event is
+    caught downstream when its definition is looked up.
+    """
     import re
-    # Match patterns like PMT.field_name, LoanEvent.principal, ProductConfig.fee_percent
-    # Event name: starts with uppercase, followed by alphanumerics/underscores
-    pattern = r'\b([A-Z][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*'
+    pattern = r'\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*'
     matches = re.findall(pattern, dsl_code)
-    # Return unique event names
-    return list(set(matches))
+    # Drop DSL/Python builtins that can appear before a dot but are never events.
+    _NOT_EVENTS = {"self", "math", "datetime", "os", "sys", "json", "re"}
+    return list({m for m in matches if m not in _NOT_EVENTS})
 
 def merge_event_data_by_instrument(event_data_dict: Dict[str, List[Dict]]) -> List[Dict]:
     """
@@ -738,9 +746,9 @@ except Exception:
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 try:
-    from backend.dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _clear_transaction_results, _get_transaction_results, _set_dsl_print
+    from backend.dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _set_current_subinstrumentid, _clear_transaction_results, _get_transaction_results, _set_dsl_print
 except Exception:
-    from dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _clear_transaction_results, _get_transaction_results, _set_dsl_print
+    from dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _set_current_subinstrumentid, _clear_transaction_results, _get_transaction_results, _set_dsl_print
 from datetime import datetime
 import json
 
@@ -890,6 +898,7 @@ def process_standalone(override_postingdate=None, override_effectivedate=None):
     
     # Set instrumentid for standalone mode
     _set_current_instrumentid('STANDALONE')
+    _set_current_subinstrumentid('1')
     
     # Expose posting_date in scope so schedule column formulas can reference it
     postingdate = override_postingdate or ''
@@ -941,9 +950,9 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 try:
-    from backend.dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _clear_transaction_results, _get_transaction_results, _set_dsl_print
+    from backend.dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _set_current_subinstrumentid, _clear_transaction_results, _get_transaction_results, _set_dsl_print
 except Exception:
-    from dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _clear_transaction_results, _get_transaction_results, _set_dsl_print
+    from dsl_functions import DSL_FUNCTIONS, _set_current_instrumentid, _set_current_postingdate, _set_current_subinstrumentid, _clear_transaction_results, _get_transaction_results, _set_dsl_print
 from datetime import datetime
 import json
 
@@ -1101,6 +1110,89 @@ def set_current_context(instrumentid, postingdate, effectivedate, subinstrumenti
         'effectivedate': effectivedate
     }
 
+# Fields that are IDENTIFIERS, not measures. Coercing these to float turned
+# subinstrumentid '1' into 1.0, so a natural join like
+#   lookup(amounts, sub_ids, subinstrumentid)
+# silently returned None -- the row built-in `subinstrumentid` is the STRING
+# '1'. Everything else on the platform (row built-ins, TransactionOutput,
+# merged event data) keeps these as strings, so collect_*() does too.
+_IDENTIFIER_FIELDS = ('instrumentid', 'subinstrumentid')
+
+
+def _is_identifier_field(actual_field, field_name):
+    \"\"\"True when the collected field is an id rather than a measure.\"\"\"
+    for candidate in (actual_field, field_name):
+        if isinstance(candidate, str) and candidate.lower() in _IDENTIFIER_FIELDS:
+            return True
+    return False
+
+
+def _row_has_field(row, name):
+    \"\"\"True when `row` carries `name` (case-insensitive).\"\"\"
+    if not isinstance(row, dict) or not isinstance(name, str):
+        return False
+    if name in row:
+        return True
+    lowered = name.lower()
+    for key in row:
+        if str(key).lower() == lowered:
+            return True
+    return False
+
+
+def _no_such_collect_field(fn_name, field_name, actual_field):
+    \"\"\"
+    Message for a collect_*() whose field exists in no loaded event.
+
+    This used to return one blank per scanned row -- an array of '' sized to
+    the ACTIVITY row count, which looks like real data and quietly zeroed
+    every downstream total. It happens when a reference event is named only
+    inside a quoted collector argument: nothing detects the reference, so
+    the event is never loaded for the run.
+    \"\"\"
+    loaded = sorted(_raw_event_data.keys())
+    known = []
+    for evt in loaded:
+        rows = _raw_event_data.get(evt) or []
+        if rows and isinstance(rows[0], dict):
+            known.append(evt + '(' + ', '.join(sorted(rows[0].keys())) + ')')
+        else:
+            known.append(evt + '(no rows)')
+    return (
+        fn_name + '(' + repr(field_name) + '): no loaded event supplies a '
+        'field named ' + repr(actual_field) + '. Loaded events: '
+        + ('; '.join(known) if known else '(none)') + '. '
+        'If the event name is part of that string, reference it in DOTTED '
+        'form instead -- ' + fn_name + '(EVENTNAME.fieldname) -- so the run '
+        'actually loads the event. A quoted name is invisible to the '
+        'event loader.')
+
+
+def _split_event_field(field_name):
+    \"\"\"
+    Split a flattened 'EVENTNAME_fieldname' reference into (event, field).
+
+    An event name may itself contain underscores (SO_EVENT, line_items,
+    sales_order). A naive field_name.split('_', 1) then picks the WRONG
+    boundary -- 'SO_EVENT_line_amount' parsed as event 'SO' + field
+    'EVENT_line_amount' -- which matches no event, so every collect_*()
+    call silently returned []. Resolve against the event names we actually
+    hold, longest first, so 'SO_EVENT' wins over a hypothetical 'SO'.
+
+    Returns (None, field_name) when no known event prefixes the name: that
+    means 'a bare field, look in every event', which is what a caller who
+    passed an unprefixed name intends.
+    \"\"\"
+    if not isinstance(field_name, str):
+        return None, field_name
+    lowered = field_name.lower()
+    for evt in sorted(_raw_event_data.keys(), key=len, reverse=True):
+        prefix = str(evt).lower() + '_'
+        if lowered.startswith(prefix) and len(field_name) > len(prefix):
+            return evt, field_name[len(prefix):]
+    return None, field_name
+
+
 def collect_by_instrument(field_name):
     \"\"\"
     Collect all values of a field for the current instrumentid only (ignores dates).
@@ -1114,14 +1206,11 @@ def collect_by_instrument(field_name):
     different instruments and break index-based joins.
     \"\"\"
     pairs = []
+    found_field = False
     current_instrument = _current_context.get('instrumentid', '')
 
-    # Parse field_name
-    parts = field_name.split('_', 1)
-    if len(parts) == 2:
-        event_name, actual_field = parts[0], parts[1]
-    else:
-        event_name, actual_field = None, field_name
+    # Parse field_name (event names may contain underscores)
+    event_name, actual_field = _split_event_field(field_name)
 
     for evt_name, rows in _raw_event_data.items():
         if event_name and evt_name.upper() != event_name.upper():
@@ -1131,6 +1220,8 @@ def collect_by_instrument(field_name):
             row_instrument = get_field_case_insensitive(row, 'instrumentid', '')
 
             if row_instrument == current_instrument:
+                if _row_has_field(row, actual_field) or _row_has_field(row, field_name):
+                    found_field = True
                 val = get_field_case_insensitive(row, actual_field, None)
                 if val is None:
                     val = get_field_case_insensitive(row, field_name, None)
@@ -1139,6 +1230,13 @@ def collect_by_instrument(field_name):
                 # scan so dates/strings don't get coerced to 0.
                 sub = get_field_case_insensitive(row, 'subinstrumentid', '') or ''
                 pairs.append((str(sub), val))
+
+    # Scanned rows but the field was on none of them -> the caller named a
+    # field (or an event) this run never loaded. Say so instead of handing
+    # back a plausible-looking array of blanks.
+    if pairs and not found_field:
+        raise ValueError(_no_such_collect_field(
+            'collect_by_instrument', field_name, actual_field))
 
     # Decide whether this is a numeric field. If every non-null value parses
     # as a number, missing entries become 0; otherwise they become ''. This
@@ -1155,12 +1253,17 @@ def collect_by_instrument(field_name):
         except (ValueError, TypeError):
             all_numeric = False
             break
-    null_placeholder = 0 if (has_value and all_numeric) else ''
+    # Identifier arrays stay textual end-to-end, so a missing id must be an
+    # empty string too - never an int 0 sitting among string ids.
+    _keep_as_text = _is_identifier_field(actual_field, field_name)
+    null_placeholder = 0 if (has_value and all_numeric and not _keep_as_text) else ''
 
     converted = []
     for s, v in pairs:
         if v is None or v == '':
             converted.append((s, null_placeholder))
+        elif _keep_as_text:
+            converted.append((s, str(v)))
         else:
             try:
                 converted.append((s, float(v)))
@@ -1194,19 +1297,18 @@ def collect_all(field_name):
     without subinstrumentid keep their natural row order.
     \"\"\"
     pairs = []
+    found_field = False
 
-    # Parse field_name
-    parts = field_name.split('_', 1)
-    if len(parts) == 2:
-        event_name, actual_field = parts[0], parts[1]
-    else:
-        event_name, actual_field = None, field_name
+    # Parse field_name (event names may contain underscores)
+    event_name, actual_field = _split_event_field(field_name)
 
     for evt_name, rows in _raw_event_data.items():
         if event_name and evt_name.upper() != event_name.upper():
             continue
 
         for idx, row in enumerate(rows):
+            if _row_has_field(row, actual_field) or _row_has_field(row, field_name):
+                found_field = True
             val = get_field_case_insensitive(row, actual_field, None)
             if val is None:
                 val = get_field_case_insensitive(row, field_name, None)
@@ -1214,6 +1316,10 @@ def collect_all(field_name):
             # index-aligned. Type-aware placeholder is decided after scan.
             sub = get_field_case_insensitive(row, 'subinstrumentid', '') or ''
             pairs.append((str(sub), idx, val))
+
+    if pairs and not found_field:
+        raise ValueError(_no_such_collect_field(
+            'collect_all', field_name, actual_field))
 
     all_numeric = True
     has_value = False
@@ -1226,12 +1332,17 @@ def collect_all(field_name):
         except (ValueError, TypeError):
             all_numeric = False
             break
-    null_placeholder = 0 if (has_value and all_numeric) else ''
+    # Identifier arrays stay textual end-to-end, so a missing id must be an
+    # empty string too - never an int 0 sitting among string ids.
+    _keep_as_text = _is_identifier_field(actual_field, field_name)
+    null_placeholder = 0 if (has_value and all_numeric and not _keep_as_text) else ''
 
     converted = []
     for s, i, v in pairs:
         if v is None or v == '':
             converted.append((s, i, null_placeholder))
+        elif _keep_as_text:
+            converted.append((s, i, str(v)))
         else:
             try:
                 converted.append((s, i, float(v)))
@@ -1260,15 +1371,13 @@ def collect_by_subinstrument(field_name):
     Hierarchy: postingDate → instrumentId → subInstrumentId → effectiveDates
     \"\"\"
     values = []
+    found_field = False
+    scanned = False
     current_instrument = _current_context.get('instrumentid', '')
     current_subinstrument = _current_context.get('subinstrumentid', '1')
     
-    # Parse field_name
-    parts = field_name.split('_', 1)
-    if len(parts) == 2:
-        event_name, actual_field = parts[0], parts[1]
-    else:
-        event_name, actual_field = None, field_name
+    # Parse field_name (event names may contain underscores)
+    event_name, actual_field = _split_event_field(field_name)
     
     for evt_name, rows in _raw_event_data.items():
         if event_name and evt_name.upper() != event_name.upper():
@@ -1279,15 +1388,24 @@ def collect_by_subinstrument(field_name):
             row_subinstrument = get_field_case_insensitive(row, 'subinstrumentid', '1') or '1'
             
             if row_instrument == current_instrument and row_subinstrument == current_subinstrument:
+                scanned = True
+                if _row_has_field(row, actual_field) or _row_has_field(row, field_name):
+                    found_field = True
                 val = get_field_case_insensitive(row, actual_field, None)
                 if val is None:
                     val = get_field_case_insensitive(row, field_name, None)
                 if val is not None and val != '':
-                    try:
-                        values.append(float(val))
-                    except (ValueError, TypeError):
-                        # For non-numeric values, store as string
-                        values.append(val)
+                    if _is_identifier_field(actual_field, field_name):
+                        values.append(str(val))
+                    else:
+                        try:
+                            values.append(float(val))
+                        except (ValueError, TypeError):
+                            # For non-numeric values, store as string
+                            values.append(val)
+    if scanned and not found_field:
+        raise ValueError(_no_such_collect_field(
+            'collect_by_subinstrument', field_name, actual_field))
     return values
 
 def collect_effectivedates_for_subinstrument(subinstrument_id=None):
@@ -1323,6 +1441,27 @@ def collect_effectivedates_for_subinstrument(subinstrument_id=None):
             if str(meta.get('eventType', 'activity')).lower() == 'reference':
                 reference_events.add(ename)
 
+    # Precise EVENT.field flattening driven by the ACTUAL event names.
+    # The legacy regex below required an UPPERCASE first letter and silently
+    # skipped lowercase / snake_case event names (e.g. `line_items`), leaving
+    # `line_items.postingdate` unconverted → `NameError: name 'line_items' is
+    # not defined` at run/test time. We convert known event names first
+    # (case-insensitive, canonicalised to the defined spelling), then keep the
+    # old uppercase-CamelCase pass as a fallback for any ref not in the metadata.
+    _event_canon = {en.lower(): en for en in all_event_fields.keys()}
+
+    def _canon_evt(evt):
+        return _event_canon.get(evt.lower(), evt)
+
+    _known_event_re = None
+    if all_event_fields:
+        _event_alt = "|".join(
+            re.escape(en) for en in
+            sorted(all_event_fields.keys(), key=len, reverse=True)
+        )
+        _known_event_re = re.compile(
+            rf"\b({_event_alt})\.([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
     lines = dsl_code.split('\n')
     i = 0
     dsl_line_num = 0
@@ -1339,17 +1478,35 @@ def collect_effectivedates_for_subinstrument(subinstrument_id=None):
 
         # Replace collect_by_instrument(...) -> use collect_all for reference events
         def _collect_by_inst_repl(m):
-            evt, fld = m.group(1), m.group(2)
+            evt, fld = _canon_evt(m.group(1)), m.group(2)
             if evt in reference_events:
                 return f"collect_all('{evt}_{fld}')"
             return f"collect_by_instrument('{evt}_{fld}')"
 
-        line = re.sub(r"collect_by_instrument\(\s*([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)", _collect_by_inst_repl, line)
+        line = re.sub(r"collect_by_instrument\(\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)", _collect_by_inst_repl, line)
+
+        # Same treatment for collect_by_subinstrument. Without this the
+        # generic EVENT.field -> EVENT_field pass below rewrote the
+        # argument into the flattened row VARIABLE (a float), and the
+        # function died with "'float' object has no attribute 'split'".
+        def _collect_by_sub_repl(m):
+            evt, fld = _canon_evt(m.group(1)), m.group(2)
+            if evt in reference_events:
+                # Reference rows carry no instrument/sub-instrument scope.
+                return f"collect_all('{evt}_{fld}')"
+            return f"collect_by_subinstrument('{evt}_{fld}')"
+
+        line = re.sub(r"collect_by_subinstrument\(\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)", _collect_by_sub_repl, line)
 
         # collect_all(EVENT.field) - always becomes collect_all('EVENT_field')
-        line = re.sub(r"collect_all\(\s*([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)", r"collect_all('\1_\2')", line)
+        line = re.sub(r"collect_all\(\s*([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+                      lambda m: f"collect_all('{_canon_evt(m.group(1))}_{m.group(2)}')", line)
 
-        # Convert EVENT.field to EVENT_field
+        # Convert EVENT.field -> EVENT_field. Known event names first (handles
+        # lowercase / snake_case), then the legacy uppercase-CamelCase fallback.
+        if _known_event_re is not None:
+            line = _known_event_re.sub(
+                lambda m: f"{_canon_evt(m.group(1))}_{m.group(2)}", line)
         line = re.sub(r"\b([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)", r"\1_\2", line)
 
         # Replace Python keyword function calls with safe aliases
@@ -1495,6 +1652,9 @@ def process_event_data(event_data, raw_event_data=None, override_postingdate=Non
         
         # Set current instrumentid for createTransaction()
         _set_current_instrumentid(instrumentid)
+        # Set current sub-instrument so schedule() can bind the
+        # `subinstrument_id` column built-in to this row.
+        _set_current_subinstrumentid(subinstrumentid)
         # Set current postingdate so print_schedule() can tag emitted rows
         # with (_instrumentid, _postingdate) for the Business Preview filter.
         _set_current_postingdate(postingdate)
@@ -1564,6 +1724,14 @@ async def execute_python_template(python_code: str, event_data: List[Dict[str, A
                 transactions = _proc(event_data, override_postingdate, override_effectivedate)
         elif 'process_standalone' in exec_globals:
             transactions = exec_globals['process_standalone'](override_postingdate, override_effectivedate)
+            # process_standalone returns (transactions, print_outputs) whereas
+            # process_event_data returns just the transactions. Treating the
+            # tuple as a list of transactions meant EVERY standalone rule came
+            # back with zero transactions -- both entries failed
+            # TransactionOutput(**...) and were quietly dropped by the
+            # normalisation loop below.
+            if isinstance(transactions, tuple):
+                transactions = transactions[0] if transactions else []
         else:
             raise RuntimeError('Template did not define a process function')
         # Normalize transactions into TransactionOutput models if needed
@@ -1587,7 +1755,26 @@ async def execute_python_template(python_code: str, event_data: List[Dict[str, A
             except Exception:
                 print_outputs = []
 
-        return {"transactions": normalized_transactions, "print_outputs": print_outputs}
+        # Surface how many transactions the zero-amount guard suppressed, so a
+        # run whose row count is lower than its input can explain the gap
+        # instead of the rows just not being there.
+        _zero_skipped = 0
+        try:
+            from backend.dsl_functions import _get_skipped_zero_amount
+        except Exception:
+            try:
+                from dsl_functions import _get_skipped_zero_amount
+            except Exception:
+                _get_skipped_zero_amount = None
+        if _get_skipped_zero_amount is not None:
+            try:
+                _zero_skipped = _get_skipped_zero_amount()
+            except Exception:
+                _zero_skipped = 0
+
+        return {"transactions": normalized_transactions,
+                "print_outputs": print_outputs,
+                "zero_amount_skipped": _zero_skipped}
     except HTTPException:
         raise
     except Exception as e:
@@ -3383,6 +3570,33 @@ async def save_ai_provider(req: AIProviderSaveRequest):
     await db.ai_provider_config.insert_one(doc)
     return {"success": True}
 
+@api_router.post("/ai/provider/selected-model")
+async def set_selected_model(payload: dict = Body(...)):
+    """Persist ONLY the selected model (no API key needed). Called when the
+    user picks a model in the chat's model dropdown so the choice becomes the
+    durable default — surviving hard refresh and localStorage clears.
+
+    We deliberately do NOT validate the id against the cached available_models
+    list: that cache can lag behind the live list the dropdown is populated
+    from, and rejecting a valid selection would silently drop the choice and
+    revert the model on the next refresh. The dropdown already constrains the
+    user to real models, so we trust the id and just store it."""
+    model_id = (payload or {}).get("selected_model")
+    if not model_id or not isinstance(model_id, str):
+        raise HTTPException(status_code=400, detail="selected_model (string) is required")
+    try:
+        result = await db.ai_provider_config.update_one(
+            {}, {"$set": {"selected_model": model_id,
+                          "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    except Exception as exc:
+        logger.error("Failed to persist selected model: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not save the selected model")
+    if getattr(result, "matched_count", 0) == 0:
+        raise HTTPException(status_code=409, detail="No AI provider configured yet")
+    return {"success": True, "selected_model": model_id}
+
+
 @api_router.get("/ai/provider/status")
 async def get_ai_provider_status():
     """Get the current provider config with dynamically refreshed model list."""
@@ -3986,6 +4200,120 @@ async def agent_reset_session(session_id: str):
             from agent import reset_session_history  # type: ignore
     cleared = await reset_session_history(session_id, db=db)
     return {"ok": True, "session_id": session_id, "cleared": cleared}
+
+
+# ── Excel workbook upload for the agent's model-import workflow ─────────────
+
+def _agent_workbook_module():
+    try:
+        from backend.agent import workbook as _wb
+    except Exception:
+        try:
+            from .agent import workbook as _wb  # type: ignore
+        except Exception:
+            from agent import workbook as _wb  # type: ignore
+    return _wb
+
+
+@api_router.post("/agent/workbooks/upload")
+async def agent_upload_workbook(file: UploadFile = File(...)):
+    """Upload an .xlsx model workbook for the agent to analyse and translate
+    into DSL rules. The file is stored on disk; the agent inspects it via the
+    list_workbooks / get_workbook_overview / get_sheet_formulas tools."""
+    wb = _agent_workbook_module()
+    content = await file.read()
+    try:
+        meta = wb.save_workbook_bytes(file.filename or "workbook.xlsx", content)
+    except wb.WorkbookError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if meta.get("duplicate_of_existing"):
+        message = (
+            f"This file is already uploaded as '{meta['filename']}' "
+            f"(workbook_id {meta['workbook_id']}) — reusing the existing "
+            f"copy instead of duplicating it."
+        )
+    else:
+        message = (
+            f"Workbook '{meta['filename']}' uploaded "
+            f"({len(meta['sheets'])} sheets). Ask the agent to analyse it — "
+            f"it will confirm which sheets are inputs / calculations / "
+            f"outputs, translate the formulas into rules, and reconcile the "
+            f"results against the workbook's numbers."
+        )
+    return {**meta, "message": message}
+
+
+@api_router.get("/agent/workbooks")
+async def agent_list_workbooks():
+    wb = _agent_workbook_module()
+    items = wb.list_workbooks()
+    return {"workbooks": items, "count": len(items)}
+
+
+@api_router.delete("/agent/workbooks/{workbook_id}")
+async def agent_delete_workbook(workbook_id: str):
+    wb = _agent_workbook_module()
+    try:
+        return wb.delete_workbook(workbook_id)
+    except wb.WorkbookError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ── Requirement documents (PDF / Word) the agent reads & builds from ────────
+
+def _agent_document_module():
+    try:
+        from backend.agent import requirements_doc as _rd
+    except Exception:
+        try:
+            from .agent import requirements_doc as _rd  # type: ignore
+        except Exception:
+            from agent import requirements_doc as _rd  # type: ignore
+    return _rd
+
+
+@api_router.post("/agent/documents/upload")
+async def agent_upload_document(file: UploadFile = File(...)):
+    """Upload a business-requirements document (PDF or Word .docx). The server
+    extracts its text; the agent reads it via the list_requirement_documents /
+    read_requirement_document tools, analyses it, asks clarifying questions,
+    then authors the rules."""
+    rd = _agent_document_module()
+    content = await file.read()
+    try:
+        meta = rd.save_document_bytes(file.filename or "document", content)
+    except rd.DocumentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if meta.get("duplicate_of_existing"):
+        message = (
+            f"This document is already uploaded as '{meta['filename']}' "
+            f"(document_id {meta['document_id']}) — reusing the existing copy."
+        )
+    else:
+        unit = (f"{meta.get('pages')} pages" if meta.get("pages")
+                else f"{meta.get('paragraphs', 0)} paragraphs")
+        message = (
+            f"Requirements document '{meta['filename']}' uploaded ({unit}). "
+            f"Ask the agent to read it — it will summarise what it understands, "
+            f"confirm the details with you, then build the rules."
+        )
+    return {**meta, "message": message}
+
+
+@api_router.get("/agent/documents")
+async def agent_list_documents():
+    rd = _agent_document_module()
+    items = rd.list_documents()
+    return {"documents": items, "count": len(items)}
+
+
+@api_router.delete("/agent/documents/{document_id}")
+async def agent_delete_document(document_id: str):
+    rd = _agent_document_module()
+    try:
+        return rd.delete_document(document_id)
+    except rd.DocumentError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 # ── Maker-checker: human review queue for agent-authored rules ──────────────

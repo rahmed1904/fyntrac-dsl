@@ -16,6 +16,14 @@ python-dotenv>=1.2,<2.0
 pandas>=2.3,<3.0
 openpyxl>=3.1,<4.0
 
+# Requirements-document ingestion (agent reads PDF / Word requirement docs)
+pypdf>=6.0,<7.0
+python-docx>=1.1,<2.0
+
+# MCP server (optional) — drive the agent from a personal Claude client.
+# Only needed to run backend/mcp_server.py; the web app doesn't import it.
+mcp>=1.28,<2.0
+
 # Security / encryption
 cryptography>=46.0,<47.0
 
