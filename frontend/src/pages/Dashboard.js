@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import axios from "axios";
 import { useToast } from "../components/ToastProvider";
-import { Upload, Code, BookOpen, Sparkles, Trash2, Search as SearchIcon, Settings, ChevronDown, Database, Calculator, Eye, Save, Menu as MenuIcon } from "lucide-react";
+import { Upload, Code, BookOpen, Sparkles, Trash2, Search as SearchIcon, Settings, ChevronDown, Database, Calculator, Eye, Save, Receipt, Menu as MenuIcon } from "lucide-react";
 import { Button, Tabs, Tab, Box, Menu, MenuItem, Divider, Alert, Typography, ToggleButtonGroup, ToggleButton, Tooltip, CircularProgress, IconButton, useMediaQuery, useTheme } from '@mui/material';
 import Editor from "@monaco-editor/react";
 import FileUploadPanel from "../components/FileUploadPanel";
@@ -16,6 +16,7 @@ import LivePreview from "../components/rulebuilder/LivePreview";
 import AccountingRuleBuilder from "../components/rulebuilder/AccountingRuleBuilder";
 import TemplateLibrary from "../components/rulebuilder/TemplateWizard";
 import ACCOUNTING_TEMPLATES from "../components/rulebuilder/AccountingTemplates";
+import TransactionReport from "../components/TransactionReport";
 import SavedRules from "../components/rulebuilder/SavedRules";
 import { API } from "../config";
 import { runAllTests } from "../agent/testing";
@@ -913,6 +914,9 @@ const Dashboard = () => {
                   <ToggleButton value="templates">
                     <Tooltip title="Browse accounting templates (ASC 310, 360, 606, 842...)"><Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}><BookOpen size={14} /> Templates</Box></Tooltip>
                   </ToggleButton>
+                  <ToggleButton value="transactionReport">
+                    <Tooltip title="All transactions across every period, by instrument and sub-instrument"><Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}><Receipt size={14} /> Transaction Report</Box></Tooltip>
+                  </ToggleButton>
                 </ToggleButtonGroup>
               </Box>
 
@@ -1184,6 +1188,13 @@ const Dashboard = () => {
                     onClose={() => setEditorMode('savedRules')}
                     inline
                   />
+                </Box>
+              )}
+
+              {/* Transaction Report Mode */}
+              {editorMode === 'transactionReport' && (
+                <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
+                  <TransactionReport />
                 </Box>
               )}
             </TabPanel>

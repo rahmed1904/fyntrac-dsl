@@ -14,15 +14,40 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-# Claude families that reject a non-default `temperature` (extended-thinking /
-# newest generations). Matched case-insensitively against the model id.
-_FIXED_TEMPERATURE_RE = re.compile(
-    r"(claude-(?:opus-4-[89]|[5-9])|claude-(?:fable|mythos))", re.IGNORECASE
-)
+# Claude generations that REMOVED `temperature` — sending it returns a 400.
+#
+# This was a regex, r'claude-(?:opus-4-[89]|[5-9])|claude-(?:fable|mythos)',
+# which silently failed to match the three ids that matter most:
+#   claude-opus-5     -> 'claude-' then '[5-9]' cannot match the 'o' of opus
+#   claude-sonnet-5   -> same
+#   claude-opus-4-7   -> '4-[89]' excludes 4-7
+# so the default model sent `temperature` on every request and every call
+# 400'd. Derive it from the parsed version instead, so the rule states the
+# actual API contract and new releases are covered without a code change.
+#
+# Removed on: Fable/Mythos (all), Opus >= 4.7, Sonnet >= 4.7 (i.e. Sonnet 5).
+# Still accepted on: Opus 4.6, Sonnet 4.6, Haiku 4.5 and older.
+_TEMPERATURE_REMOVED_FLOOR = 4.7
+_TEMPERATURE_FREE_TIERS = ('fable', 'mythos')
 
 
 def _fixed_temperature_model(model: str) -> bool:
-    return bool(_FIXED_TEMPERATURE_RE.search(model or ""))
+    """
+    True when `model` rejects an explicit `temperature`.
+
+    Unrecognised ids default to True: omitting temperature costs nothing (the
+    server uses its default) whereas sending it to a model that removed it is
+    a hard 400, so an unknown future model should fail safe.
+    """
+    parsed = _claude_version(model)
+    if not parsed:
+        return True
+    tier, ver = parsed
+    if tier in _TEMPERATURE_FREE_TIERS:
+        return True
+    if tier == 'haiku':
+        return False
+    return ver >= _TEMPERATURE_REMOVED_FLOOR
 
 
 # ── Capability floor ────────────────────────────────────────────────────────
@@ -68,11 +93,26 @@ def _agent_capable(model_id: str) -> bool:
     return ver >= _CLAUDE_TIER_FLOORS.get(tier, _CLAUDE_DEFAULT_FLOOR)
 
 
+# Phrases the API has used when rejecting `temperature`. The list used to
+# omit the current wording ('extra inputs are not permitted'), so the
+# fallback retry never fired and the 400 surfaced to the user instead.
+_TEMPERATURE_REJECTED_PHRASES = (
+    "deprecated", "not supported", "unsupported", "only the default",
+    "does not support", "extra inputs are not permitted", "not permitted",
+    "unexpected keyword", "removed", "cannot be specified", "not allowed",
+)
+
+
+def _no_forced_tool_choice(model: str) -> bool:
+    """True when tool_choice 'any'/'tool' returns a 400 for this model."""
+    parsed = _claude_version(model)
+    return bool(parsed) and parsed[0] in _TEMPERATURE_FREE_TIERS
+
+
 def _is_unsupported_temperature(exc: Exception) -> bool:
     m = str(exc).lower()
-    return "temperature" in m and (
-        "deprecated" in m or "not supported" in m or "unsupported" in m
-        or "only the default" in m or "does not support" in m
+    return "temperature" in m and any(
+        p in m for p in _TEMPERATURE_REJECTED_PHRASES
     )
 
 
@@ -407,11 +447,23 @@ class AnthropicProvider(AIProvider):
 
             # I19: tool_choice mapping. Internal "required" → Anthropic
             # {"type":"any"}; "none"/None → default (auto).
+            #
+            # Fable / Mythos removed FORCED tool use: both {'type':'any'} and
+            # {'type':'tool'} return a 400 there. Fall back to auto (the
+            # default) for those families rather than sending a request that
+            # cannot succeed — the agent's prompt already names the tool it
+            # wants, which is the documented replacement.
             anth_tool_choice = None
             if tool_choice == "required":
                 anth_tool_choice = {"type": "any"}
             elif tool_choice and tool_choice not in ("auto", "none"):
                 anth_tool_choice = {"type": "tool", "name": tool_choice}
+            if anth_tool_choice and _no_forced_tool_choice(model):
+                logger.info(
+                    "Model %s does not support forced tool_choice — using auto",
+                    model,
+                )
+                anth_tool_choice = None
 
             create_kwargs = dict(
                 model=model,

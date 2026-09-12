@@ -3504,6 +3504,267 @@ async def execute_template(request: TemplateExecuteRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@api_router.post("/transaction-reports/run")
+async def run_transaction_report(template_id: Optional[str] = None,
+                                 replace: bool = True):
+    """Generate transactions for EVERY instrument and EVERY posting date.
+
+    Drives the Play button on the Transaction Report. One call runs the whole
+    book: it discovers every posting date present in the activity data and
+    executes the model once per date, so the report covers all periods rather
+    than the single date a normal execution targets.
+
+    `template_id` runs a saved template; omitted, it runs the current
+    workspace (all saved rules combined by priority) — which is what the
+    report button means by "the loaded template".
+
+    `replace` (default) clears previous reports first. The report view
+    aggregates every stored run, so appending would double every row on a
+    second press.
+    """
+    try:
+        # ── 1. Resolve the code to run ────────────────────────────────
+        template_name = "Workspace rules"
+        if template_id:
+            template = None
+            try:
+                template = await db.dsl_templates.find_one(
+                    {"id": template_id}, {"_id": 0})
+            except Exception:
+                template = None
+            if not template:
+                for t in (in_memory_data.get("templates") or []) + list(SAMPLE_TEMPLATES):
+                    if t.get("id") == template_id or t.get("name") == template_id:
+                        template = t
+                        break
+            if not template:
+                raise HTTPException(status_code=404, detail="Template not found")
+            dsl_code = template.get("dsl_code") or ""
+            template_name = template.get("name") or template_id
+        else:
+            combined = await get_combined_code()
+            dsl_code = (combined or {}).get("code") or ""
+
+        if not dsl_code.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Nothing to run — no saved rules and no template selected.")
+
+        # ── 2. Load every referenced event ────────────────────────────
+        referenced_events = extract_event_names_from_dsl(dsl_code) or []
+        if not referenced_events:
+            raise HTTPException(
+                status_code=400,
+                detail="The rules reference no events, so there is nothing to run.")
+
+        all_event_fields = {}
+        event_metadata = {}
+        event_data_dict = {}
+        missing = []
+        for name in referenced_events:
+            ev = await db.event_definitions.find_one(
+                {"event_name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}},
+                {"_id": 0})
+            if not ev:
+                missing.append(name)
+                continue
+            canonical = ev["event_name"]
+            all_event_fields[canonical] = ev.get("fields", [])
+            event_metadata[canonical] = {
+                "eventType": ev.get("eventType", "activity")}
+            rows = await db.event_data.find_one(
+                {"event_name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}},
+                {"_id": 0})
+            event_data_dict[canonical] = (rows or {}).get("data_rows") or []
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Event definition(s) not found: {', '.join(missing)}")
+
+        # ── 3. Every posting date in the activity data ────────────────
+        posting_dates = sorted({
+            str(get_field_case_insensitive(row, "postingdate", "")).strip()
+            for name, rows in event_data_dict.items()
+            if str(event_metadata.get(name, {}).get("eventType", "activity")).lower() != "reference"
+            for row in rows
+            if str(get_field_case_insensitive(row, "postingdate", "")).strip()
+        })
+
+        # ── 4. Start clean so a second press does not double the book ──
+        if replace:
+            try:
+                await db.transaction_reports.delete_many({})
+            except Exception:
+                pass
+            in_memory_data["transaction_reports"] = []
+
+        python_code = dsl_to_python_multi_event(dsl_code, all_event_fields)
+
+        # ── 5. One execution per posting date ─────────────────────────
+        # No dates at all means undated data: run once, unscoped, rather
+        # than reporting "nothing to do".
+        dates_to_run = posting_dates or [None]
+        runs, errors = [], []
+        total_txns = 0
+
+        for pdate in dates_to_run:
+            try:
+                scoped = (filter_event_data_by_posting_date(
+                              event_data_dict, pdate, event_metadata)
+                          if pdate else event_data_dict)
+                merged = merge_event_data_by_instrument(scoped)
+                if not merged:
+                    runs.append({"posting_date": pdate, "instruments": 0,
+                                 "transactions": 0})
+                    continue
+                result = await execute_python_template(
+                    python_code, merged, event_data_dict, pdate, None)
+                txns = [t.model_dump() for t in (result.get("transactions") or [])]
+                total_txns += len(txns)
+
+                report = TransactionReport(
+                    template_name=template_name,
+                    event_name=", ".join(referenced_events),
+                    transactions=txns)
+                doc = report.model_dump()
+                doc["executed_at"] = doc["executed_at"].isoformat()
+                try:
+                    await db.transaction_reports.insert_one(doc)
+                except Exception:
+                    in_memory_data.setdefault("transaction_reports", []).append(doc)
+
+                runs.append({"posting_date": pdate, "instruments": len(merged),
+                             "transactions": len(txns)})
+            except HTTPException as exc:
+                errors.append({"posting_date": pdate, "error": exc.detail})
+            except Exception as exc:
+                # One bad date must not abandon the rest of the book.
+                errors.append({"posting_date": pdate, "error": str(exc)})
+
+        return {
+            "message": (f"Ran {len(runs)} of {len(dates_to_run)} posting date(s) — "
+                        f"{total_txns} transaction(s)"),
+            "template_name": template_name,
+            "posting_dates": [d for d in dates_to_run if d],
+            "dates_total": len(dates_to_run),
+            "dates_succeeded": len(runs),
+            "dates_failed": len(errors),
+            "transactions_created": total_txns,
+            "runs": runs,
+            "errors": errors,
+            "events_used": referenced_events,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Transaction report run failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/transaction-reports")
+async def get_transaction_reports(
+    limit: int = 5000,
+    offset: int = 0,
+    instrumentid: Optional[str] = None,
+    template_name: Optional[str] = None,
+):
+    """Every transaction ever produced, flattened across all runs.
+
+    Each execution stores its own transaction_reports document holding that
+    run's transactions. The report view needs the whole history as one
+    table, so flatten every document and sort the rows into the canonical
+    order: instrumentid, postingdate, effectivedate, subinstrumentid,
+    amount.
+
+    Rows carry their provenance (template_name, executed_at) so a row can be
+    traced back to the run that produced it. `limit`/`offset` page the
+    result — on a real portfolio this table is contracts x lines x periods,
+    so it is never returned unbounded.
+    """
+    try:
+        docs = []
+        try:
+            docs = await db.transaction_reports.find({}, {"_id": 0}).to_list(100000)
+        except Exception:
+            docs = list((in_memory_data or {}).get("transaction_reports") or [])
+        if not docs:
+            docs = list((in_memory_data or {}).get("transaction_reports") or [])
+
+        rows = []
+        for doc in docs:
+            tpl = doc.get("template_name") or ""
+            executed = doc.get("executed_at") or ""
+            if template_name and tpl != template_name:
+                continue
+            for t in (doc.get("transactions") or []):
+                if not isinstance(t, dict):
+                    continue
+                iid = str(t.get("instrumentid") or "")
+                if instrumentid and iid != instrumentid:
+                    continue
+                try:
+                    amount = float(t.get("amount") or 0)
+                except (TypeError, ValueError):
+                    amount = 0.0
+                rows.append({
+                    "instrumentid": iid,
+                    "subinstrumentid": str(t.get("subinstrumentid") or "1"),
+                    "postingdate": str(t.get("postingdate") or ""),
+                    "effectivedate": str(t.get("effectivedate") or ""),
+                    "transactiontype": str(t.get("transactiontype") or ""),
+                    "amount": amount,
+                    "template_name": tpl,
+                    "executed_at": executed,
+                })
+
+        def _sub_key(v):
+            # Numeric-aware so sub-instrument 10 sorts after 9, not after 1.
+            try:
+                return (0, float(v), "")
+            except (TypeError, ValueError):
+                return (1, 0.0, str(v))
+
+        rows.sort(key=lambda r: (
+            r["instrumentid"],
+            r["postingdate"],
+            r["effectivedate"],
+            _sub_key(r["subinstrumentid"]),
+            r["amount"],
+        ))
+
+        total = len(rows)
+        total_amount = round(sum(r["amount"] for r in rows), 4)
+        instruments = sorted({r["instrumentid"] for r in rows if r["instrumentid"]})
+        templates = sorted({r["template_name"] for r in rows if r["template_name"]})
+        types = sorted({r["transactiontype"] for r in rows if r["transactiontype"]})
+
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(int(limit or 5000), 50000))
+        page = rows[offset:offset + limit]
+
+        return {
+            "transactions": page,
+            "total": total,
+            "returned": len(page),
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(page) < total,
+            "summary": {
+                "total_amount": total_amount,
+                "instrument_count": len(instruments),
+                "run_count": len(docs),
+            },
+            "filters": {
+                "instruments": instruments[:1000],
+                "templates": templates,
+                "transaction_types": types,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error building transaction report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @api_router.delete("/transaction-reports/all")
 async def delete_all_transaction_reports():
     """Wipe all transaction reports"""
